@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/crazywolf132/SecretFetch"
+	"github.com/crazywolf132/secretfetch"
 )
 
 // DatabaseConfig holds configuration for database connections including secrets
@@ -44,7 +44,7 @@ type Config struct {
 	RawData []byte `secret:"env=RAW_DATA"`
 
 	// Additional fields
-	Debug    bool   `secret:"env:DEBUG"`
+	Debug bool `secret:"env:DEBUG"`
 }
 
 func main() {
