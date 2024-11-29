@@ -5,7 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"strings"
+	"os"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -48,40 +48,32 @@ type Config struct {
 }
 
 func main() {
-	// Create an empty config struct
-	cfg := &Config{}
+	// Set up environment variables for testing
+	os.Setenv("SECRET_ARN", "arn:aws:secretsmanager:region:account:secret:name")
+	os.Setenv("DB_HOST", "localhost")
+	os.Setenv("DB_PORT", "5432")
+	os.Setenv("DB_USER", "admin")
 
-	// Create options for customized behavior
+	// Create an empty config struct
+	cfg := &DatabaseConfig{}
+
+	// Create options with AWS configuration
 	opts := &secretfetch.Options{
 		AWS: &aws.Config{
-			Region: "us-west-2",
-		},
-		Validators: map[string]secretfetch.ValidationFunc{
-			"api_key": func(s string) error {
-				if len(s) != 32 {
-					return fmt.Errorf("API key must be 32 characters long")
-				}
-				return nil
-			},
-		},
-		Transformers: map[string]secretfetch.TransformFunc{
-			"uppercase": func(s string) (string, error) {
-				return strings.ToUpper(s), nil
-			},
+			Region: "us-west-2", // This can also be set via AWS_REGION environment variable
 		},
 	}
 
-	// Populate all secrets with advanced features
+	// Fetch all secrets
 	ctx := context.Background()
 	if err := secretfetch.Fetch(ctx, cfg, opts); err != nil {
 		log.Fatalf("Failed to fetch secrets: %v", err)
 	}
 
-	// Use your fully populated config!
-	fmt.Printf("Environment: %s\n", cfg.Environment)
-	fmt.Printf("Database Config: %+v\n", cfg.Database)
-	fmt.Printf("Session Timeout: %v\n", cfg.SessionTimeout)
-	fmt.Printf("Max Connections: %d\n", cfg.MaxConnections)
-	fmt.Printf("Certificate Length: %d bytes\n", len(cfg.Certificate))
-	fmt.Printf("Raw Data Length: %d bytes\n", len(cfg.RawData))
+	// Use the configuration
+	fmt.Printf("Database Configuration:\n")
+	fmt.Printf("Host: %s\n", cfg.Host)
+	fmt.Printf("Port: %d\n", cfg.Port)
+	fmt.Printf("Username: %s\n", cfg.Username)
+	fmt.Printf("Password: [REDACTED]\n")
 }

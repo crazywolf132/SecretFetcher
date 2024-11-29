@@ -6,6 +6,7 @@ package secretfetch
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"os"
 	"reflect"
@@ -72,6 +73,12 @@ type cachedValue struct {
 	value      string
 	expiration time.Time
 }
+
+var (
+	secretsCache map[string]string
+	secretsMu    sync.RWMutex
+	secretsOnce  sync.Once
+)
 
 func validatePattern(value, pattern string) error {
 	re, err := regexp.Compile(pattern)
@@ -428,23 +435,73 @@ func (s *secret) Get(ctx context.Context, opts *Options) (string, error) {
 }
 
 func (s *secret) getFromAWS(ctx context.Context, awsConfig *aws.Config) (string, error) {
+	if s.awsKey == "" {
+		return "", nil
+	}
+
+	// Try to get from cache first
+	secretsMu.RLock()
+	if value, ok := secretsCache[s.awsKey]; ok {
+		secretsMu.RUnlock()
+		return value, nil
+	}
+	secretsMu.RUnlock()
+
+	// Initialize cache if needed
+	secretsOnce.Do(func() {
+		secretsCache = make(map[string]string)
+	})
+
+	// Load AWS config
 	cfg, err := config.LoadDefaultConfig(ctx, func(o *config.LoadOptions) error {
-		o.Region = awsConfig.Region
-		o.Credentials = awsConfig.Credentials
+		if awsConfig != nil {
+			o.Region = awsConfig.Region
+			o.Credentials = awsConfig.Credentials
+		}
 		return nil
 	})
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("unable to load AWS config: %w", err)
 	}
 
+	// Create client and fetch secret
 	client := secretsmanager.NewFromConfig(cfg)
 	input := &secretsmanager.GetSecretValueInput{
 		SecretId: aws.String(s.awsKey),
 	}
-	if result, err := client.GetSecretValue(ctx, input); err == nil {
-		return *result.SecretString, nil
+
+	result, err := client.GetSecretValue(ctx, input)
+	if err != nil {
+		return "", fmt.Errorf("failed to get AWS secret %s: %w", s.awsKey, err)
 	}
-	return "", err
+
+	if result.SecretString == nil {
+		return "", fmt.Errorf("no secret string found for %s", s.awsKey)
+	}
+
+	// Try to parse as JSON first
+	var secretMap map[string]string
+	if err := json.Unmarshal([]byte(*result.SecretString), &secretMap); err == nil {
+		// If successful, cache all values
+		secretsMu.Lock()
+		for k, v := range secretMap {
+			secretsCache[k] = v
+		}
+		secretsMu.Unlock()
+		
+		// Return the specific key if it exists
+		if value, ok := secretMap[s.awsKey]; ok {
+			return value, nil
+		}
+		// If key not found in JSON, use the entire string
+	}
+
+	// Cache and return the raw string
+	secretsMu.Lock()
+	secretsCache[s.awsKey] = *result.SecretString
+	secretsMu.Unlock()
+
+	return *result.SecretString, nil
 }
 
 // FetchAndValidate is an alias for Fetch to maintain backward compatibility
