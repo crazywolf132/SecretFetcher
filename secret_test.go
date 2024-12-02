@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -355,6 +356,358 @@ func TestSecret_Get(t *testing.T) {
 			} else {
 				require.NoError(t, err)
 				assert.Equal(t, tt.expected, reflect.ValueOf(tt.config).Elem().Field(0).String())
+			}
+		})
+	}
+}
+
+// TestSecureValue tests the secureValue type methods
+func TestSecureValue(t *testing.T) {
+	sv := &secureValue{}
+
+	t.Run("set_and_get", func(t *testing.T) {
+		value := "test-secret"
+		sv.Set(value)
+		assert.Equal(t, value, sv.Get())
+	})
+
+	t.Run("clear", func(t *testing.T) {
+		value := "test-secret"
+		sv.Set(value)
+		sv.Clear()
+		assert.Equal(t, "", sv.Get())
+	})
+}
+
+// TestGetFromAWS tests the AWS secret fetching functionality
+func TestGetFromAWS(t *testing.T) {
+	t.Run("aws_not_configured", func(t *testing.T) {
+		s := &secret{
+			awsKey: "test/secret",
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		
+		_, err := s.getFromAWS(ctx, nil)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "context deadline exceeded")
+	})
+}
+
+// TestFetchAndValidate tests the backward compatibility function
+func TestFetchAndValidate(t *testing.T) {
+	type Config struct {
+		Value string `secret:"env=TEST_VALUE,required"`
+	}
+
+	t.Run("fetch_and_validate", func(t *testing.T) {
+		os.Setenv("TEST_VALUE", "test")
+		defer os.Unsetenv("TEST_VALUE")
+
+		var cfg Config
+		err := FetchAndValidate(context.Background(), &cfg)
+		require.NoError(t, err)
+		assert.Equal(t, "test", cfg.Value)
+	})
+
+	t.Run("validation_error", func(t *testing.T) {
+		var cfg Config
+		err := FetchAndValidate(context.Background(), &cfg)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "required")
+	})
+}
+
+// TestCachedValue tests the cachedValue type methods
+func TestCachedValue(t *testing.T) {
+	t.Run("string_representation", func(t *testing.T) {
+		cv := &cachedValue{
+			value: "test-value",
+		}
+		assert.Equal(t, "test-value", cv.String())
+
+		cv = &cachedValue{
+			value: 123,
+		}
+		assert.Equal(t, "123", cv.String())
+
+		cv = &cachedValue{
+			secure: &secureValue{},
+		}
+		cv.secure.Set("secure-value")
+		assert.Equal(t, "secure-value", cv.String())
+	})
+
+	t.Run("clear", func(t *testing.T) {
+		cv := &cachedValue{
+			value: "test-value",
+		}
+		cv.Clear()
+		assert.Nil(t, cv.value)
+
+		cv = &cachedValue{
+			secure: &secureValue{},
+		}
+		cv.secure.Set("secure-value")
+		cv.Clear()
+		assert.Equal(t, "", cv.secure.Get())
+	})
+}
+
+// TestParseTag tests the tag parsing functionality
+func TestParseTag(t *testing.T) {
+	type Config struct {
+		Basic     string        `secret:"env=BASIC"`
+		Duration  time.Duration `secret:"env=DURATION,transform=duration"`
+		JSON      interface{}   `secret:"env=JSON,json"`
+		YAML      interface{}   `secret:"env=YAML,yaml"`
+		Transform string        `secret:"env=TRANSFORM,transform=upper"`
+		AWS       string        `secret:"aws=test/secret"`
+		Invalid   string        `secret:"invalid_tag"`
+		Pattern   string        `secret:"env=PATTERN,pattern=[0-9]+"`
+		Required  string        `secret:"env=REQUIRED,required"`
+		Base64    string        `secret:"env=BASE64,base64"`
+	}
+
+	opts := &Options{
+		Transformers: map[string]TransformFunc{
+			"upper": func(s string) (string, error) {
+				return strings.ToUpper(s), nil
+			},
+			"duration": func(s string) (string, error) {
+				_, err := time.ParseDuration(s)
+				return s, err
+			},
+		},
+	}
+
+	v := reflect.ValueOf(Config{})
+	tests := []struct {
+		name      string
+		field     string
+		expectErr bool
+	}{
+		{"basic", "Basic", false},
+		{"duration", "Duration", false},
+		{"json", "JSON", false},
+		{"yaml", "YAML", false},
+		{"transform", "Transform", false},
+		{"aws", "AWS", false},
+		{"invalid", "Invalid", true},
+		{"pattern", "Pattern", false},
+		{"required", "Required", false},
+		{"base64", "Base64", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			field, _ := v.Type().FieldByName(tt.field)
+			_, err := parseTag(field, opts)
+			if tt.expectErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+// TestSecretGet tests the secret.Get method with various configurations
+func TestSecretGet(t *testing.T) {
+	tests := []struct {
+		name      string
+		secret    *secret
+		envValue  string
+		expected  string
+		expectErr bool
+	}{
+		{
+			name: "env_with_transform",
+			secret: &secret{
+				envKey: "TEST_ENV",
+				transform: func(s string) (string, error) {
+					return strings.ToUpper(s), nil
+				},
+			},
+			envValue:  "test",
+			expected: "TEST",
+		},
+		{
+			name: "env_with_validation_error",
+			secret: &secret{
+				envKey: "TEST_ENV",
+				validation: func(s string) error {
+					return fmt.Errorf("validation error")
+				},
+			},
+			envValue:  "test",
+			expectErr: true,
+		},
+		{
+			name: "required_missing",
+			secret: &secret{
+				envKey:   "TEST_ENV",
+				required: true,
+			},
+			expectErr: true,
+		},
+		{
+			name: "with_fallback",
+			secret: &secret{
+				envKey:   "TEST_ENV",
+				fallback: "fallback-value",
+			},
+			expected: "fallback-value",
+		},
+		{
+			name: "with_pattern",
+			secret: &secret{
+				envKey:  "TEST_ENV",
+				pattern: regexp.MustCompile(`^[0-9]+$`),
+			},
+			envValue:  "123",
+			expected: "123",
+		},
+		{
+			name: "pattern_mismatch",
+			secret: &secret{
+				envKey:  "TEST_ENV",
+				pattern: regexp.MustCompile(`^[0-9]+$`),
+			},
+			envValue:  "abc",
+			expectErr: true,
+		},
+		{
+			name: "base64_decode",
+			secret: &secret{
+				envKey:   "TEST_ENV",
+				isBase64: true,
+			},
+			envValue:  base64.StdEncoding.EncodeToString([]byte("test")),
+			expected: "test",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.envValue != "" {
+				os.Setenv(tt.secret.envKey, tt.envValue)
+				defer os.Unsetenv(tt.secret.envKey)
+			}
+
+			value, err := tt.secret.Get(context.Background(), &Options{})
+			if tt.expectErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, tt.expected, value)
+			}
+		})
+	}
+}
+
+// TestNewCachedValue tests the newCachedValue function
+func TestNewCachedValue(t *testing.T) {
+	t.Run("standard_value", func(t *testing.T) {
+		expiration := time.Now().Add(time.Hour)
+		cv := newCachedValue("test", expiration, false)
+		assert.Equal(t, "test", cv.value)
+		assert.Equal(t, expiration, cv.expiration)
+		assert.Nil(t, cv.secure)
+	})
+
+	t.Run("secure_value", func(t *testing.T) {
+		expiration := time.Now().Add(time.Hour)
+		cv := newCachedValue("test", expiration, true)
+		assert.Nil(t, cv.value)
+		assert.Equal(t, expiration, cv.expiration)
+		assert.NotNil(t, cv.secure)
+		assert.Equal(t, "test", cv.secure.Get())
+	})
+}
+
+// TestFetch tests the Fetch function with various configurations
+func TestFetch(t *testing.T) {
+	type Config struct {
+		Basic     string        `secret:"env=BASIC"`
+		Required  string        `secret:"env=REQUIRED,required"`
+		Duration  time.Duration `secret:"env=DURATION"`
+		Pattern   string        `secret:"env=PATTERN,pattern=[0-9]+"`
+		Transform string        `secret:"env=TRANSFORM,transform=upper"`
+		AWS       string        `secret:"aws=test/secret"`
+	}
+
+	opts := &Options{
+		Transformers: map[string]TransformFunc{
+			"upper": func(s string) (string, error) {
+				return strings.ToUpper(s), nil
+			},
+		},
+	}
+
+	tests := []struct {
+		name      string
+		config    interface{}
+		setup     func()
+		cleanup   func()
+		expectErr bool
+	}{
+		{
+			name:   "valid_config",
+			config: &Config{},
+			setup: func() {
+				os.Setenv("BASIC", "basic")
+				os.Setenv("REQUIRED", "required")
+				os.Setenv("DURATION", "3600000000000")  // 1h in nanoseconds
+				os.Setenv("PATTERN", "123")
+				os.Setenv("TRANSFORM", "test")
+			},
+			cleanup: func() {
+				os.Unsetenv("BASIC")
+				os.Unsetenv("REQUIRED")
+				os.Unsetenv("DURATION")
+				os.Unsetenv("PATTERN")
+				os.Unsetenv("TRANSFORM")
+			},
+		},
+		{
+			name:      "nil_config",
+			config:    nil,
+			expectErr: true,
+		},
+		{
+			name:      "non_pointer_config",
+			config:    Config{},
+			expectErr: true,
+		},
+		{
+			name:      "non_struct_config",
+			config:    &[]string{},
+			expectErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.setup != nil {
+				tt.setup()
+			}
+			if tt.cleanup != nil {
+				defer tt.cleanup()
+			}
+
+			err := Fetch(context.Background(), tt.config, opts)
+			if tt.expectErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+				if cfg, ok := tt.config.(*Config); ok {
+					assert.Equal(t, "basic", cfg.Basic)
+					assert.Equal(t, "required", cfg.Required)
+					assert.Equal(t, time.Hour, cfg.Duration)
+					assert.Equal(t, "123", cfg.Pattern)
+					assert.Equal(t, "TEST", cfg.Transform)
+				}
 			}
 		})
 	}

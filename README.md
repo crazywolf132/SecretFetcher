@@ -174,6 +174,47 @@ opts := &secretfetch.Options{
 }
 ```
 
+## Enterprise Security Features 🛡️
+
+SecretFetch is built with enterprise-grade security in mind:
+
+### Secure Memory Handling
+```go
+opts := &secretfetch.Options{
+    SecureCache: true,  // Enable secure memory for caching
+}
+```
+- Zero-copy memory handling
+- Automatic memory zeroing
+- Thread-safe operations
+- Optional secure caching
+
+### Audit & Compliance
+```go
+opts := &secretfetch.Options{
+    OnSecretAccess: func(ctx context.Context, secretID string) {
+        audit.Log("Secret accessed", "id", secretID)
+    },
+    MetricsCollector: &metrics.SecurityMetrics{
+        OnSecretAccess: func(metric metrics.SecretAccessMetric) {
+            prometheus.SecretAccessCounter.Inc()
+        },
+    },
+}
+```
+- Detailed audit logging
+- Prometheus metrics integration
+- Access tracking
+- Compliance reporting
+
+### AWS Security Best Practices
+- IAM role support
+- VPC endpoint compatibility
+- KMS integration
+- CloudTrail logging
+
+See our [SECURITY.md](SECURITY.md) for detailed security documentation and enterprise compliance information.
+
 ## 🏆 Why Better Than Alternatives?
 
 ### vs Direct AWS SDK

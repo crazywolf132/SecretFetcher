@@ -39,8 +39,97 @@ type Options struct {
 	PreloadARNs bool
 	// SecretsManager is the AWS Secrets Manager client
 	SecretsManager SecretsManagerClient
+	// OnSecretAccess is called whenever a secret is accessed
+	OnSecretAccess func(ctx context.Context, secretID string)
+	// MetricsCollector collects security metrics
+	MetricsCollector SecurityMetricsCollector
+	// SecureCache indicates whether to use secure memory for caching
+	SecureCache bool
 	cacheMu     sync.RWMutex
 	cache       map[string]*cachedValue
+}
+
+// SecurityMetricsCollector defines the interface for collecting security metrics
+type SecurityMetricsCollector interface {
+	// OnSecretAccess is called when a secret is accessed
+	OnSecretAccess(metric SecretAccessMetric)
+}
+
+// SecretAccessMetric contains information about a secret access event
+type SecretAccessMetric struct {
+	// SecretID is the identifier of the secret
+	SecretID string
+	// AccessTime is when the secret was accessed
+	AccessTime time.Time
+	// Source indicates where the secret came from (AWS, env, etc.)
+	Source string
+	// CacheHit indicates if the secret was served from cache
+	CacheHit bool
+}
+
+// secureValue represents a secret value with secure memory handling
+type secureValue struct {
+	value []byte
+	mu    sync.RWMutex
+}
+
+func (s *secureValue) Set(value string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.value = make([]byte, len(value))
+	copy(s.value, value)
+}
+
+func (s *secureValue) Get() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return string(s.value)
+}
+
+func (s *secureValue) Clear() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.value {
+		s.value[i] = 0
+	}
+	s.value = nil
+}
+
+// cachedValue represents a cached secret value
+type cachedValue struct {
+	value      interface{}
+	expiration time.Time
+	secure     *secureValue
+}
+
+func (cv *cachedValue) String() string {
+	if cv.secure != nil {
+		return cv.secure.Get()
+	}
+	if str, ok := cv.value.(string); ok {
+		return str
+	}
+	return fmt.Sprintf("%v", cv.value)
+}
+
+func (cv *cachedValue) Clear() {
+	if cv.secure != nil {
+		cv.secure.Clear()
+	}
+	cv.value = nil
+}
+
+func newCachedValue(value string, expiration time.Time, secure bool) *cachedValue {
+	cv := &cachedValue{
+		expiration: expiration,
+	}
+	if secure {
+		cv.secure = &secureValue{}
+		cv.secure.Set(value)
+	} else {
+		cv.value = value
+	}
+	return cv
 }
 
 // OptionsKey is the key for storing Options in the context
@@ -79,11 +168,6 @@ type secret struct {
 	mu         sync.RWMutex
 	cache      *cachedValue
 	required   bool
-}
-
-type cachedValue struct {
-	value      string
-	expiration time.Time
 }
 
 var (
@@ -378,7 +462,15 @@ func (s *secret) Get(ctx context.Context, opts *Options) (string, error) {
 	cached, ok := opts.cache[cacheKey]
 	opts.cacheMu.RUnlock()
 	if ok && time.Now().Before(cached.expiration) {
-		return cached.value, nil
+		if opts.MetricsCollector != nil {
+			opts.MetricsCollector.OnSecretAccess(SecretAccessMetric{
+				SecretID:  s.awsKey,
+				AccessTime: time.Now(),
+				Source:     "cache",
+				CacheHit:   true,
+			})
+		}
+		return cached.String(), nil
 	}
 
 	var lastErr error
@@ -402,12 +494,19 @@ func (s *secret) Get(ctx context.Context, opts *Options) (string, error) {
 			} else {
 				// Cache the processed value if caching is enabled
 				if opts.CacheDuration > 0 {
+					expiration := time.Now().Add(opts.CacheDuration)
+					cv := newCachedValue(processedValue, expiration, opts.SecureCache)
 					opts.cacheMu.Lock()
-					opts.cache[cacheKey] = &cachedValue{
-						value:      processedValue,
-						expiration: time.Now().Add(opts.CacheDuration),
-					}
+					opts.cache[cacheKey] = cv
 					opts.cacheMu.Unlock()
+				}
+				if opts.MetricsCollector != nil {
+					opts.MetricsCollector.OnSecretAccess(SecretAccessMetric{
+						SecretID:  s.awsKey,
+						AccessTime: time.Now(),
+						Source:     "aws",
+						CacheHit:   false,
+					})
 				}
 				return processedValue, nil
 			}
@@ -427,12 +526,19 @@ func (s *secret) Get(ctx context.Context, opts *Options) (string, error) {
 			} else {
 				// Cache the processed value if caching is enabled
 				if opts.CacheDuration > 0 {
+					expiration := time.Now().Add(opts.CacheDuration)
+					cv := newCachedValue(processedValue, expiration, opts.SecureCache)
 					opts.cacheMu.Lock()
-					opts.cache[cacheKey] = &cachedValue{
-						value:      processedValue,
-						expiration: time.Now().Add(opts.CacheDuration),
-					}
+					opts.cache[cacheKey] = cv
 					opts.cacheMu.Unlock()
+				}
+				if opts.MetricsCollector != nil {
+					opts.MetricsCollector.OnSecretAccess(SecretAccessMetric{
+						SecretID:  s.awsKey,
+						AccessTime: time.Now(),
+						Source:     "env",
+						CacheHit:   false,
+					})
 				}
 				return processedValue, nil
 			}
@@ -451,12 +557,19 @@ func (s *secret) Get(ctx context.Context, opts *Options) (string, error) {
 		} else {
 			// Cache the processed fallback value if caching is enabled
 			if opts.CacheDuration > 0 {
+				expiration := time.Now().Add(opts.CacheDuration)
+				cv := newCachedValue(processedValue, expiration, opts.SecureCache)
 				opts.cacheMu.Lock()
-				opts.cache[cacheKey] = &cachedValue{
-					value:      processedValue,
-					expiration: time.Now().Add(opts.CacheDuration),
-				}
+				opts.cache[cacheKey] = cv
 				opts.cacheMu.Unlock()
+			}
+			if opts.MetricsCollector != nil {
+				opts.MetricsCollector.OnSecretAccess(SecretAccessMetric{
+					SecretID:  s.awsKey,
+					AccessTime: time.Now(),
+					Source:     "fallback",
+					CacheHit:   false,
+				})
 			}
 			return processedValue, nil
 		}
@@ -556,11 +669,10 @@ func preloadSecretsFromARNs(ctx context.Context, opts *Options) error {
 
 		// Cache the secret
 		cacheKey := "aws:" + arn
+		expiration := time.Now().Add(opts.CacheDuration)
+		cv := newCachedValue(*result.SecretString, expiration, opts.SecureCache)
 		opts.cacheMu.Lock()
-		opts.cache[cacheKey] = &cachedValue{
-			value:      *result.SecretString,
-			expiration: time.Now().Add(opts.CacheDuration),
-		}
+		opts.cache[cacheKey] = cv
 		opts.cacheMu.Unlock()
 	}
 
