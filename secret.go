@@ -6,7 +6,6 @@ package secretfetch
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"os"
 	"reflect"
@@ -21,6 +20,11 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
 )
 
+// SecretsManagerClient defines the interface for AWS Secrets Manager operations
+type SecretsManagerClient interface {
+	GetSecretValue(ctx context.Context, params *secretsmanager.GetSecretValueInput, optFns ...func(*secretsmanager.Options)) (*secretsmanager.GetSecretValueOutput, error)
+}
+
 // Options holds configuration options for fetching secrets
 type Options struct {
 	// AWS is the AWS configuration
@@ -33,9 +37,14 @@ type Options struct {
 	CacheDuration time.Duration
 	// PreloadARNs indicates whether to preload secrets from ARNs
 	PreloadARNs bool
+	// SecretsManager is the AWS Secrets Manager client
+	SecretsManager SecretsManagerClient
 	cacheMu     sync.RWMutex
 	cache       map[string]*cachedValue
 }
+
+// OptionsKey is the key for storing Options in the context
+var optionsKey = "secretfetch-options"
 
 // ValidationFunc is a function type for custom validation
 type ValidationFunc func(string) error
@@ -276,6 +285,9 @@ func Fetch(ctx context.Context, v interface{}, opts *Options) error {
 		opts.cache = make(map[string]*cachedValue)
 	}
 
+	// Store options in context
+	ctx = context.WithValue(ctx, optionsKey, opts)
+
 	// Preload secrets from ARNs if enabled
 	if opts.PreloadARNs {
 		if err := preloadSecretsFromARNs(ctx, opts); err != nil {
@@ -470,69 +482,35 @@ func (s *secret) getFromAWS(ctx context.Context, awsConfig *aws.Config) (string,
 		return "", nil
 	}
 
-	// Try to get from cache first
-	secretsMu.RLock()
-	if value, ok := secretsCache[s.awsKey]; ok {
-		secretsMu.RUnlock()
-		return value, nil
-	}
-	secretsMu.RUnlock()
-
-	// Initialize cache if needed
-	secretsOnce.Do(func() {
-		secretsCache = make(map[string]string)
-	})
-
-	// Load AWS config
-	cfg, err := config.LoadDefaultConfig(ctx, func(o *config.LoadOptions) error {
-		if awsConfig != nil {
-			o.Region = awsConfig.Region
-			o.Credentials = awsConfig.Credentials
+	var client SecretsManagerClient
+	if opts, ok := ctx.Value(optionsKey).(*Options); ok && opts.SecretsManager != nil {
+		client = opts.SecretsManager
+	} else {
+		cfg := awsConfig
+		if cfg == nil {
+			defaultCfg, err := config.LoadDefaultConfig(ctx)
+			if err != nil {
+				return "", fmt.Errorf("unable to load AWS config: %v", err)
+			}
+			cfg = &defaultCfg
 		}
-		return nil
-	})
-	if err != nil {
-		return "", fmt.Errorf("unable to load AWS config: %w", err)
+		client = secretsmanager.NewFromConfig(*cfg)
 	}
 
-	// Create client and fetch secret
-	client := secretsmanager.NewFromConfig(cfg)
 	input := &secretsmanager.GetSecretValueInput{
 		SecretId: aws.String(s.awsKey),
 	}
 
 	result, err := client.GetSecretValue(ctx, input)
 	if err != nil {
-		return "", fmt.Errorf("failed to get AWS secret %s: %w", s.awsKey, err)
+		return "", fmt.Errorf("error fetching secret %s: %v", s.awsKey, err)
 	}
 
-	if result.SecretString == nil {
-		return "", fmt.Errorf("no secret string found for %s", s.awsKey)
+	if result.SecretString != nil {
+		return *result.SecretString, nil
 	}
 
-	// Try to parse as JSON first
-	var secretMap map[string]string
-	if err := json.Unmarshal([]byte(*result.SecretString), &secretMap); err == nil {
-		// If successful, cache all values
-		secretsMu.Lock()
-		for k, v := range secretMap {
-			secretsCache[k] = v
-		}
-		secretsMu.Unlock()
-
-		// Return the specific key if it exists
-		if value, ok := secretMap[s.awsKey]; ok {
-			return value, nil
-		}
-		// If key not found in JSON, use the entire string
-	}
-
-	// Cache and return the raw string
-	secretsMu.Lock()
-	secretsCache[s.awsKey] = *result.SecretString
-	secretsMu.Unlock()
-
-	return *result.SecretString, nil
+	return "", fmt.Errorf("no secret string found for %s", s.awsKey)
 }
 
 // FetchAndValidate is an alias for Fetch to maintain backward compatibility
@@ -542,60 +520,48 @@ func FetchAndValidate(ctx context.Context, v interface{}) error {
 
 // preloadSecretsFromARNs fetches secrets from AWS Secrets Manager and caches them
 func preloadSecretsFromARNs(ctx context.Context, opts *Options) error {
-	secretArns := getSecretARNs()
-	if len(secretArns) == 0 {
+	arns := getSecretARNs()
+	if len(arns) == 0 {
 		return fmt.Errorf("no secret ARNs found in environment variables SECRET_ARNS or SECRET_ARN")
 	}
 
-	if opts.AWS == nil {
-		// Load default AWS config if not provided
-		cfg, err := config.LoadDefaultConfig(ctx)
-		if err != nil {
-			return fmt.Errorf("unable to load AWS config: %w", err)
-		}
-		opts.AWS = &cfg
-	}
-
-	client := secretsmanager.NewFromConfig(*opts.AWS)
-
-	var wg sync.WaitGroup
-	errorsCh := make(chan error, len(secretArns))
-
-	for _, arn := range secretArns {
-		wg.Add(1)
-		go func(arn string) {
-			defer wg.Done()
-			output, err := client.GetSecretValue(ctx, &secretsmanager.GetSecretValueInput{
-				SecretId: aws.String(arn),
-			})
+	var client SecretsManagerClient
+	if opts.SecretsManager != nil {
+		client = opts.SecretsManager
+	} else {
+		cfg := opts.AWS
+		if cfg == nil {
+			defaultCfg, err := config.LoadDefaultConfig(ctx)
 			if err != nil {
-				errorsCh <- fmt.Errorf("error fetching secret %s: %w", arn, err)
-				return
+				return fmt.Errorf("unable to load AWS config: %v", err)
 			}
-
-			var secretPairs map[string]string
-			if err := json.Unmarshal([]byte(aws.ToString(output.SecretString)), &secretPairs); err != nil {
-				// If it's not JSON, store the raw secret string
-				secretPairs = map[string]string{
-					arn: aws.ToString(output.SecretString),
-				}
-			}
-
-			// Cache the secrets
-			secretsMu.Lock()
-			for k, v := range secretPairs {
-				secretsCache[k] = v
-			}
-			secretsMu.Unlock()
-		}(arn)
+			cfg = &defaultCfg
+		}
+		client = secretsmanager.NewFromConfig(*cfg)
 	}
 
-	wg.Wait()
-	close(errorsCh)
+	for _, arn := range arns {
+		input := &secretsmanager.GetSecretValueInput{
+			SecretId: aws.String(arn),
+		}
 
-	// Check for errors
-	if len(errorsCh) > 0 {
-		return <-errorsCh // Return the first error encountered
+		result, err := client.GetSecretValue(ctx, input)
+		if err != nil {
+			return fmt.Errorf("error fetching secret %s: %v", arn, err)
+		}
+
+		if result.SecretString == nil {
+			return fmt.Errorf("no secret string found for %s", arn)
+		}
+
+		// Cache the secret
+		cacheKey := "aws:" + arn
+		opts.cacheMu.Lock()
+		opts.cache[cacheKey] = &cachedValue{
+			value:      *result.SecretString,
+			expiration: time.Now().Add(opts.CacheDuration),
+		}
+		opts.cacheMu.Unlock()
 	}
 
 	return nil

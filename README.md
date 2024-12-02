@@ -7,11 +7,26 @@
 [![GoDoc](https://godoc.org/github.com/crazywolf132/SecretFetch?status.svg)](https://godoc.org/github.com/crazywolf132/SecretFetch)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
+## 🤔 The Problem
+
+You're building a Go application and need to manage secrets. You've got a few options, but none of them are great:
+
+1. **Hardcode them** (Please don't! 🙈)
+2. **Use environment variables** (Manual management, no validation, scattered across your codebase)
+3. **Use AWS Secrets Manager directly** (Complex API, no caching, lots of boilerplate)
+4. **Write your own solution** (Time-consuming, error-prone, reinventing the wheel)
+
+What if you could have:
+- The simplicity of environment variables
+- The security of AWS Secrets Manager
+- Built-in caching and validation
+- All with just a few struct tags?
+
+That's where SecretFetch comes in! 🚀
+
 ## 🌟 Why SecretFetch?
 
-Managing secrets in Go applications can be a pain. AWS Secrets Manager is powerful but complex. Environment variables are simple but limited. What if you could have the best of both worlds?
-
-SecretFetch gives you:
+SecretFetch gives you the best of all worlds:
 
 - 🎯 **Dead Simple API** - Just add struct tags and go!
 - 🔄 **Multi-Source Support** - AWS Secrets Manager, env vars, and fallbacks in one place
@@ -20,15 +35,7 @@ SecretFetch gives you:
 - 🛡️ **Validation** - Pattern matching and custom validators to catch issues early
 - 🔧 **Flexibility** - Transform values, decode base64, parse JSON/YAML
 - 🏃‍♂️ **Zero Config** - Works out of the box with sane defaults
-
-## 🤔 The Problem
-
-You're building a Go application and need to manage secrets. You have a few options:
-
-1. **Hardcode them** (Please don't!)
-2. **Use environment variables** (Manual management, no validation)
-3. **Use AWS Secrets Manager directly** (Complex API, no caching, lots of boilerplate)
-4. **Use SecretFetch** (Simple, flexible, and powerful!)
+- 🔌 **Testability** - Mock AWS Secrets Manager for unit testing
 
 ## 🚀 Quick Start
 
@@ -59,6 +66,7 @@ if err := secretfetch.Fetch(context.Background(), cfg, nil); err != nil {
 ### 🔐 AWS Secrets Manager Integration
 
 ```go
+// Option 1: Parse JSON secrets
 type DatabaseConfig struct {
     Host     string `json:"host"`
     Username string `json:"username"`
@@ -69,6 +77,43 @@ type Config struct {
     // Parse entire database config from AWS Secrets Manager
     DB DatabaseConfig `secret:"aws=prod/db/config,json"`
 }
+
+// Option 2: Preload ARNs for better performance
+opts := &secretfetch.Options{
+    PreloadARNs: true,  // Enable ARN preloading
+    AWS: &aws.Config{   // Optional: provide custom AWS config
+        Region: "us-west-2",
+    },
+}
+
+// Configure ARNs through environment variables
+// In development:
+os.Setenv("SECRET_ARNS", "arn:aws:secretsmanager:region:account:secret:name1,arn:aws:secretsmanager:region:account:secret:name2")
+// or
+os.Setenv("SECRET_ARN", "arn:aws:secretsmanager:region:account:secret:name")
+
+// In production (ECS/Docker), configure in your task definition or docker-compose:
+/*
+  # ECS Task Definition
+  {
+    "containerDefinitions": [
+      {
+        "environment": [
+          {
+            "name": "SECRET_ARNS",
+            "value": "arn:aws:secretsmanager:region:account:secret:name1,arn:aws:secretsmanager:region:account:secret:name2"
+          }
+        ]
+      }
+    ]
+  }
+
+  # docker-compose.yml
+  services:
+    app:
+      environment:
+        - SECRET_ARNS=arn:aws:secretsmanager:region:account:secret:name1,arn:aws:secretsmanager:region:account:secret:name2
+*/
 ```
 
 ### 🔍 Pattern Validation
@@ -87,7 +132,7 @@ type Config struct {
 
 ```go
 opts := &secretfetch.Options{
-    Transformers: map[string]secretfetch.TransformerFunc{
+    Transformers: map[string]secretfetch.TransformFunc{
         "API_KEY": func(value string) (string, error) {
             return strings.TrimSpace(value), nil
         },
@@ -98,12 +143,34 @@ opts := &secretfetch.Options{
 ### ⚡ Smart Caching
 
 ```go
-type Config struct {
-    // Cache for 5 minutes
-    APIKey string `secret:"aws=prod/api/key,ttl=5m"`
-    
-    // Cache indefinitely
-    StaticConfig string `secret:"aws=prod/static/config,ttl=-1"`
+opts := &secretfetch.Options{
+    CacheDuration: 5 * time.Minute,  // Cache secrets for 5 minutes
+}
+```
+
+### 🧪 Testing Support
+
+SecretFetch makes testing a breeze with its mock interfaces:
+
+```go
+// Mock AWS Secrets Manager client for testing
+type mockSecretsManagerClient struct {
+    getSecretValueFn func(ctx context.Context, params *secretsmanager.GetSecretValueInput, optFns ...func(*secretsmanager.Options)) (*secretsmanager.GetSecretValueOutput, error)
+}
+
+func (m *mockSecretsManagerClient) GetSecretValue(ctx context.Context, params *secretsmanager.GetSecretValueInput, optFns ...func(*secretsmanager.Options)) (*secretsmanager.GetSecretValueOutput, error) {
+    return m.getSecretValueFn(ctx, params, optFns...)
+}
+
+// Use in tests
+opts := &secretfetch.Options{
+    SecretsManager: &mockSecretsManagerClient{
+        getSecretValueFn: func(ctx context.Context, params *secretsmanager.GetSecretValueInput, optFns ...func(*secretsmanager.Options)) (*secretsmanager.GetSecretValueOutput, error) {
+            return &secretsmanager.GetSecretValueOutput{
+                SecretString: aws.String("test-secret-value"),
+            }, nil
+        },
+    },
 }
 ```
 
@@ -127,23 +194,42 @@ type Config struct {
 - 🔧 **Flexible** - Multiple sources, validation, transformation
 - 📚 **Well Documented** - Comprehensive examples and guides
 
-## 🛠️ Advanced Usage
+## 📚 Advanced Configuration
 
-For a comprehensive technical deep-dive into all features and capabilities, check out our [Technical Documentation](TECHNICAL.md).
+### Options
 
-Additional resources in our [Wiki](https://github.com/crazywolf132/SecretFetch/wiki):
-
-- Custom Validation Functions
-- AWS Configuration Options
-- Caching Strategies
-- Error Handling
-- Testing Strategies
-- Best Practices
+```go
+type Options struct {
+    // AWS configuration
+    AWS *aws.Config
+    
+    // Custom validation functions
+    Validators map[string]ValidationFunc
+    
+    // Custom transformation functions
+    Transformers map[string]TransformFunc
+    
+    // Cache duration for secrets
+    CacheDuration time.Duration
+    
+    // Enable ARN preloading
+    PreloadARNs bool
+    
+    // Custom Secrets Manager client for testing
+    SecretsManager SecretsManagerClient
+}
+```
 
 ## 🤝 Contributing
 
-We love contributions! Check out our [Contributing Guide](CONTRIBUTING.md) to get started.
+Found a bug? Have a cool idea? Want to make SecretFetch even more awesome? We'd love your help! Feel free to:
+- 🐛 Open an issue
+- 🎉 Submit a PR
+- 🌟 Give us a star
+- 📚 Improve our docs
 
 ## 📝 License
 
-MIT © [Brayden](LICENSE)
+This project is licensed under the MIT License - see the LICENSE file for details.
+
+Made with ❤️ by [Brayden](https://github.com/crazywolf132)
