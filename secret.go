@@ -464,7 +464,7 @@ func (s *secret) Get(ctx context.Context, opts *Options) (string, error) {
 	if ok && time.Now().Before(cached.expiration) {
 		if opts.MetricsCollector != nil {
 			opts.MetricsCollector.OnSecretAccess(SecretAccessMetric{
-				SecretID:  s.awsKey,
+				SecretID:   s.awsKey,
 				AccessTime: time.Now(),
 				Source:     "cache",
 				CacheHit:   true,
@@ -502,7 +502,7 @@ func (s *secret) Get(ctx context.Context, opts *Options) (string, error) {
 				}
 				if opts.MetricsCollector != nil {
 					opts.MetricsCollector.OnSecretAccess(SecretAccessMetric{
-						SecretID:  s.awsKey,
+						SecretID:   s.awsKey,
 						AccessTime: time.Now(),
 						Source:     "aws",
 						CacheHit:   false,
@@ -534,7 +534,7 @@ func (s *secret) Get(ctx context.Context, opts *Options) (string, error) {
 				}
 				if opts.MetricsCollector != nil {
 					opts.MetricsCollector.OnSecretAccess(SecretAccessMetric{
-						SecretID:  s.awsKey,
+						SecretID:   s.awsKey,
 						AccessTime: time.Now(),
 						Source:     "env",
 						CacheHit:   false,
@@ -565,7 +565,7 @@ func (s *secret) Get(ctx context.Context, opts *Options) (string, error) {
 			}
 			if opts.MetricsCollector != nil {
 				opts.MetricsCollector.OnSecretAccess(SecretAccessMetric{
-					SecretID:  s.awsKey,
+					SecretID:   s.awsKey,
 					AccessTime: time.Now(),
 					Source:     "fallback",
 					CacheHit:   false,
@@ -623,7 +623,11 @@ func (s *secret) getFromAWS(ctx context.Context, awsConfig *aws.Config) (string,
 		return *result.SecretString, nil
 	}
 
-	return "", fmt.Errorf("no secret string found for %s", s.awsKey)
+	if result.SecretBinary != nil {
+		return string(result.SecretBinary), nil
+	}
+
+	return "", fmt.Errorf("no secret value found for %s", s.awsKey)
 }
 
 // FetchAndValidate is an alias for Fetch to maintain backward compatibility
@@ -663,14 +667,19 @@ func preloadSecretsFromARNs(ctx context.Context, opts *Options) error {
 			return fmt.Errorf("error fetching secret %s: %v", arn, err)
 		}
 
-		if result.SecretString == nil {
-			return fmt.Errorf("no secret string found for %s", arn)
+		if result.SecretString == nil && result.SecretBinary == nil {
+			return fmt.Errorf("no secret value found for %s", arn)
 		}
 
 		// Cache the secret
 		cacheKey := "aws:" + arn
 		expiration := time.Now().Add(opts.CacheDuration)
-		cv := newCachedValue(*result.SecretString, expiration, opts.SecureCache)
+		var cv *cachedValue
+		if result.SecretString != nil {
+			cv = newCachedValue(*result.SecretString, expiration, opts.SecureCache)
+		} else {
+			cv = newCachedValue(string(result.SecretBinary), expiration, opts.SecureCache)
+		}
 		opts.cacheMu.Lock()
 		opts.cache[cacheKey] = cv
 		opts.cacheMu.Unlock()

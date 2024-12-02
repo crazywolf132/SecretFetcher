@@ -13,15 +13,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// mockSecretsManagerClient is a mock implementation of the AWS Secrets Manager client
-type mockSecretsManagerClient struct {
-	getSecretValueFn func(ctx context.Context, params *secretsmanager.GetSecretValueInput, optFns ...func(*secretsmanager.Options)) (*secretsmanager.GetSecretValueOutput, error)
-}
-
-func (m *mockSecretsManagerClient) GetSecretValue(ctx context.Context, params *secretsmanager.GetSecretValueInput, optFns ...func(*secretsmanager.Options)) (*secretsmanager.GetSecretValueOutput, error) {
-	return m.getSecretValueFn(ctx, params, optFns...)
-}
-
 func TestPreloadSecretsFromARNs(t *testing.T) {
 	// Setup test environment
 	testCases := []struct {
@@ -96,16 +87,22 @@ func TestPreloadSecretsFromARNs(t *testing.T) {
 		},
 	}
 
+	mockClient := &mockSecretsManagerClient{
+		getSecretValueFn: func(ctx context.Context, params *secretsmanager.GetSecretValueInput, optFns ...func(*secretsmanager.Options)) (*secretsmanager.GetSecretValueOutput, error) {
+			return &secretsmanager.GetSecretValueOutput{
+				SecretString: aws.String("test-secret-value"),
+			}, nil
+		},
+	}
+
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			// Setup
 			tc.setupEnv()
 			defer tc.cleanupEnv()
 
-			// Create mock client
-			mockClient := &mockSecretsManagerClient{
-				getSecretValueFn: tc.mockFn,
-			}
+			// Set mock function
+			mockClient.getSecretValueFn = tc.mockFn
 
 			// Create test options with mock client
 			opts := &Options{
@@ -199,29 +196,22 @@ func TestPreloadARNsIntegration(t *testing.T) {
 		t.Skip("Skipping integration test")
 	}
 
-	// Setup test environment
-	testARN := "arn:aws:secretsmanager:us-west-2:123456789012:secret:test-secret"
-	os.Setenv("SECRET_ARN", testARN)
-	defer os.Unsetenv("SECRET_ARN")
-
-	// Create test options with AWS config
+	// Create test options
 	opts := &Options{
-		PreloadARNs:    true,
-		CacheDuration:  time.Minute,
-		cache:          make(map[string]*cachedValue),
+		PreloadARNs:   true,
+		CacheDuration: time.Minute,
+		cache:         make(map[string]*cachedValue),
+		AWS: &aws.Config{
+			Region: "us-west-2",
+		},
 	}
 
 	// Execute test
 	err := preloadSecretsFromARNs(context.Background(), opts)
 	require.NoError(t, err)
 
-	// Verify the secret was cached
-	opts.cacheMu.RLock()
-	defer opts.cacheMu.RUnlock()
-	
-	// Check if the secret exists in the cache
-	cacheKey := "aws:" + testARN
-	cachedSecret, exists := opts.cache[cacheKey]
+	// Verify cache
+	cachedSecret, exists := opts.cache["test-secret"]
 	assert.True(t, exists)
 	assert.NotNil(t, cachedSecret)
 }

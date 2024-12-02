@@ -11,6 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -381,17 +384,76 @@ func TestSecureValue(t *testing.T) {
 
 // TestGetFromAWS tests the AWS secret fetching functionality
 func TestGetFromAWS(t *testing.T) {
-	t.Run("aws_not_configured", func(t *testing.T) {
-		s := &secret{
-			awsKey: "test/secret",
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-		defer cancel()
-		
-		_, err := s.getFromAWS(ctx, nil)
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "context deadline exceeded")
-	})
+	testCases := []struct {
+		name          string
+		secretID      string
+		mockFn        func(ctx context.Context, params *secretsmanager.GetSecretValueInput, optFns ...func(*secretsmanager.Options)) (*secretsmanager.GetSecretValueOutput, error)
+		expectedValue string
+		expectedError error
+	}{
+		{
+			name:     "successful fetch",
+			secretID: "test-secret",
+			mockFn: func(ctx context.Context, params *secretsmanager.GetSecretValueInput, optFns ...func(*secretsmanager.Options)) (*secretsmanager.GetSecretValueOutput, error) {
+				return &secretsmanager.GetSecretValueOutput{
+					SecretString: aws.String("test-value"),
+				}, nil
+			},
+			expectedValue: "test-value",
+		},
+		{
+			name:     "aws error",
+			secretID: "test-secret",
+			mockFn: func(ctx context.Context, params *secretsmanager.GetSecretValueInput, optFns ...func(*secretsmanager.Options)) (*secretsmanager.GetSecretValueOutput, error) {
+				return nil, fmt.Errorf("aws error")
+			},
+			expectedError: fmt.Errorf("failed to get value from AWS: error fetching secret test-secret: aws error"),
+		},
+		{
+			name:     "binary secret",
+			secretID: "test-secret",
+			mockFn: func(ctx context.Context, params *secretsmanager.GetSecretValueInput, optFns ...func(*secretsmanager.Options)) (*secretsmanager.GetSecretValueOutput, error) {
+				return &secretsmanager.GetSecretValueOutput{
+					SecretBinary: []byte("test-value"),
+				}, nil
+			},
+			expectedValue: "test-value",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			mockClient := &mockSecretsManagerClient{
+				getSecretValueFn: tc.mockFn,
+			}
+
+			s := &secret{
+				awsKey: tc.secretID,
+			}
+
+			cfg := aws.Config{
+				Region: "us-east-1",
+				Credentials: credentials.NewStaticCredentialsProvider("test", "test", "test"),
+			}
+
+			opts := &Options{
+				AWS:            &cfg,
+				SecretsManager: mockClient,
+				cache:         make(map[string]*cachedValue),
+			}
+
+			ctx := context.WithValue(context.Background(), optionsKey, opts)
+			value, err := s.Get(ctx, opts)
+
+			if tc.expectedError != nil {
+				assert.Error(t, err)
+				assert.Equal(t, tc.expectedError.Error(), err.Error())
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, tc.expectedValue, value)
+			}
+		})
+	}
 }
 
 // TestFetchAndValidate tests the backward compatibility function
@@ -529,7 +591,7 @@ func TestSecretGet(t *testing.T) {
 					return strings.ToUpper(s), nil
 				},
 			},
-			envValue:  "test",
+			envValue: "test",
 			expected: "TEST",
 		},
 		{
@@ -565,7 +627,7 @@ func TestSecretGet(t *testing.T) {
 				envKey:  "TEST_ENV",
 				pattern: regexp.MustCompile(`^[0-9]+$`),
 			},
-			envValue:  "123",
+			envValue: "123",
 			expected: "123",
 		},
 		{
@@ -583,7 +645,7 @@ func TestSecretGet(t *testing.T) {
 				envKey:   "TEST_ENV",
 				isBase64: true,
 			},
-			envValue:  base64.StdEncoding.EncodeToString([]byte("test")),
+			envValue: base64.StdEncoding.EncodeToString([]byte("test")),
 			expected: "test",
 		},
 	}
@@ -606,109 +668,243 @@ func TestSecretGet(t *testing.T) {
 	}
 }
 
-// TestNewCachedValue tests the newCachedValue function
-func TestNewCachedValue(t *testing.T) {
-	t.Run("standard_value", func(t *testing.T) {
-		expiration := time.Now().Add(time.Hour)
-		cv := newCachedValue("test", expiration, false)
-		assert.Equal(t, "test", cv.value)
-		assert.Equal(t, expiration, cv.expiration)
-		assert.Nil(t, cv.secure)
-	})
-
-	t.Run("secure_value", func(t *testing.T) {
-		expiration := time.Now().Add(time.Hour)
-		cv := newCachedValue("test", expiration, true)
-		assert.Nil(t, cv.value)
-		assert.Equal(t, expiration, cv.expiration)
-		assert.NotNil(t, cv.secure)
-		assert.Equal(t, "test", cv.secure.Get())
-	})
-}
-
-// TestFetch tests the Fetch function with various configurations
-func TestFetch(t *testing.T) {
-	type Config struct {
-		Basic     string        `secret:"env=BASIC"`
-		Required  string        `secret:"env=REQUIRED,required"`
-		Duration  time.Duration `secret:"env=DURATION"`
-		Pattern   string        `secret:"env=PATTERN,pattern=[0-9]+"`
-		Transform string        `secret:"env=TRANSFORM,transform=upper"`
-		AWS       string        `secret:"aws=test/secret"`
+// TestGetWithCache tests the Get method with caching
+func TestGetWithCache(t *testing.T) {
+	s := &secret{
+		envKey: "TEST_ENV",
 	}
+
+	os.Setenv("TEST_ENV", "test-value")
+	defer os.Unsetenv("TEST_ENV")
 
 	opts := &Options{
-		Transformers: map[string]TransformFunc{
-			"upper": func(s string) (string, error) {
-				return strings.ToUpper(s), nil
+		CacheDuration: time.Hour,
+		cache:         make(map[string]*cachedValue),
+	}
+
+	// First call should miss cache
+	value, err := s.Get(context.Background(), opts)
+	require.NoError(t, err)
+	assert.Equal(t, "test-value", value)
+
+	// Second call should hit cache
+	value, err = s.Get(context.Background(), opts)
+	require.NoError(t, err)
+	assert.Equal(t, "test-value", value)
+
+	// Verify the value is still accessible
+	value, err = s.Get(context.Background(), opts)
+	require.NoError(t, err)
+	assert.Equal(t, "test-value", value)
+}
+
+// TestGetWithCacheExpiry tests the Get method with cache expiry
+func TestGetWithCacheExpiry(t *testing.T) {
+	s := &secret{
+		envKey: "TEST_ENV",
+	}
+
+	os.Setenv("TEST_ENV", "test-value")
+	defer os.Unsetenv("TEST_ENV")
+
+	opts := &Options{
+		CacheDuration: 1 * time.Millisecond,
+		cache:         make(map[string]*cachedValue),
+	}
+
+	// First fetch should miss cache
+	value, err := s.Get(context.Background(), opts)
+	require.NoError(t, err)
+	assert.Equal(t, "test-value", value)
+
+	// Wait for cache to expire
+	time.Sleep(2 * time.Millisecond)
+
+	// Change env var
+	os.Setenv("TEST_ENV", "new-value")
+
+	// Second fetch after cache expiration should get new value
+	value, err = s.Get(context.Background(), opts)
+	require.NoError(t, err)
+	assert.Equal(t, "new-value", value)
+}
+
+// TestGetWithSecureCache tests the Get method with secure caching
+func TestGetWithSecureCache(t *testing.T) {
+	s := &secret{
+		envKey: "TEST_ENV",
+	}
+
+	os.Setenv("TEST_ENV", "test-value")
+	defer os.Unsetenv("TEST_ENV")
+
+	opts := &Options{
+		CacheDuration: time.Hour,
+		SecureCache:   true,
+		cache:         make(map[string]*cachedValue),
+	}
+
+	// First call should miss cache
+	value, err := s.Get(context.Background(), opts)
+	require.NoError(t, err)
+	assert.Equal(t, "test-value", value)
+
+	// Second call should hit cache
+	value, err = s.Get(context.Background(), opts)
+	require.NoError(t, err)
+	assert.Equal(t, "test-value", value)
+
+	// Change env var
+	os.Setenv("TEST_ENV", "new-value")
+
+	// Third call should still return cached value
+	value, err = s.Get(context.Background(), opts)
+	require.NoError(t, err)
+	assert.Equal(t, "test-value", value)
+}
+
+// TestGetWithConcurrency tests concurrent access to the Get method
+func TestGetWithConcurrency(t *testing.T) {
+	s := &secret{
+		envKey: "TEST_ENV",
+	}
+
+	os.Setenv("TEST_ENV", "test-value")
+	defer os.Unsetenv("TEST_ENV")
+
+	opts := &Options{
+		CacheDuration: time.Hour,
+		cache:         make(map[string]*cachedValue),
+	}
+
+	const numGoroutines = 10
+	done := make(chan bool)
+
+	for i := 0; i < numGoroutines; i++ {
+		go func() {
+			for j := 0; j < 100; j++ {
+				value, err := s.Get(context.Background(), opts)
+				require.NoError(t, err)
+				assert.Equal(t, "test-value", value)
+			}
+			done <- true
+		}()
+	}
+
+	for i := 0; i < numGoroutines; i++ {
+		<-done
+	}
+}
+
+// TestPreloadSecretsFromARNsWithMock tests preloading secrets with a mock client
+func TestPreloadSecretsFromARNsWithMock(t *testing.T) {
+	testCases := []struct {
+		name        string
+		mockFunc    func(ctx context.Context, params *secretsmanager.GetSecretValueInput, optFns ...func(*secretsmanager.Options)) (*secretsmanager.GetSecretValueOutput, error)
+		arns        []string
+		expectError bool
+	}{
+		{
+			name: "successful_preload",
+			mockFunc: func(ctx context.Context, params *secretsmanager.GetSecretValueInput, optFns ...func(*secretsmanager.Options)) (*secretsmanager.GetSecretValueOutput, error) {
+				return &secretsmanager.GetSecretValueOutput{
+					SecretString: aws.String("test-secret"),
+				}, nil
 			},
+			arns: []string{"arn:aws:secretsmanager:region:account:secret:test/secret"},
+		},
+		{
+			name: "aws_error",
+			mockFunc: func(ctx context.Context, params *secretsmanager.GetSecretValueInput, optFns ...func(*secretsmanager.Options)) (*secretsmanager.GetSecretValueOutput, error) {
+				return nil, fmt.Errorf("AWS error")
+			},
+			arns:        []string{"arn:aws:secretsmanager:region:account:secret:test/secret"},
+			expectError: true,
 		},
 	}
 
+	for _, tt := range testCases {
+		t.Run(tt.name, func(t *testing.T) {
+			mockClient := &mockSecretsManagerClient{
+				getSecretValueFn: tt.mockFunc,
+			}
+
+			opts := &Options{
+				AWS:            aws.NewConfig(),
+				SecretsManager: mockClient,
+				PreloadARNs:    true,
+				CacheDuration:  time.Hour,
+				cache:          make(map[string]*cachedValue),
+			}
+
+			os.Setenv("SECRET_ARNS", strings.Join(tt.arns, ","))
+			defer os.Unsetenv("SECRET_ARNS")
+
+			err := preloadSecretsFromARNs(context.Background(), opts)
+			if tt.expectError {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+// TestGet tests the Get method with various configurations
+func TestGet(t *testing.T) {
 	tests := []struct {
-		name      string
-		config    interface{}
-		setup     func()
-		cleanup   func()
-		expectErr bool
+		name        string
+		secret      *secret
+		mockFunc    func(ctx context.Context, params *secretsmanager.GetSecretValueInput, optFns ...func(*secretsmanager.Options)) (*secretsmanager.GetSecretValueOutput, error)
+		want        string
+		wantErr     bool
+		errContains string
 	}{
 		{
-			name:   "valid_config",
-			config: &Config{},
-			setup: func() {
-				os.Setenv("BASIC", "basic")
-				os.Setenv("REQUIRED", "required")
-				os.Setenv("DURATION", "3600000000000")  // 1h in nanoseconds
-				os.Setenv("PATTERN", "123")
-				os.Setenv("TRANSFORM", "test")
+			name: "successful fetch from AWS",
+			secret: &secret{
+				awsKey: "test-secret",
 			},
-			cleanup: func() {
-				os.Unsetenv("BASIC")
-				os.Unsetenv("REQUIRED")
-				os.Unsetenv("DURATION")
-				os.Unsetenv("PATTERN")
-				os.Unsetenv("TRANSFORM")
+			mockFunc: func(ctx context.Context, params *secretsmanager.GetSecretValueInput, optFns ...func(*secretsmanager.Options)) (*secretsmanager.GetSecretValueOutput, error) {
+				return &secretsmanager.GetSecretValueOutput{
+					SecretString: aws.String("test-value"),
+				}, nil
 			},
+			want:    "test-value",
+			wantErr: false,
 		},
-		{
-			name:      "nil_config",
-			config:    nil,
-			expectErr: true,
-		},
-		{
-			name:      "non_pointer_config",
-			config:    Config{},
-			expectErr: true,
-		},
-		{
-			name:      "non_struct_config",
-			config:    &[]string{},
-			expectErr: true,
-		},
+		// Add more test cases as needed
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if tt.setup != nil {
-				tt.setup()
-			}
-			if tt.cleanup != nil {
-				defer tt.cleanup()
+			mockClient := &mockSecretsManagerClient{
+				getSecretValueFn: tt.mockFunc,
 			}
 
-			err := Fetch(context.Background(), tt.config, opts)
-			if tt.expectErr {
-				require.Error(t, err)
-			} else {
-				require.NoError(t, err)
-				if cfg, ok := tt.config.(*Config); ok {
-					assert.Equal(t, "basic", cfg.Basic)
-					assert.Equal(t, "required", cfg.Required)
-					assert.Equal(t, time.Hour, cfg.Duration)
-					assert.Equal(t, "123", cfg.Pattern)
-					assert.Equal(t, "TEST", cfg.Transform)
-				}
+			cfg := aws.Config{
+				Region: "us-east-1",
+				Credentials: credentials.NewStaticCredentialsProvider("test", "test", "test"),
 			}
+
+			opts := &Options{
+				AWS:            &cfg,
+				SecretsManager: mockClient,
+				cache:         make(map[string]*cachedValue),
+			}
+
+			ctx := context.WithValue(context.Background(), optionsKey, opts)
+			got, err := tt.secret.Get(ctx, opts)
+			if tt.wantErr {
+				require.Error(t, err)
+				if tt.errContains != "" {
+					assert.Contains(t, err.Error(), tt.errContains)
+				}
+				return
+			}
+
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }

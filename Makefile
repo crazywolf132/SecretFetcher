@@ -8,6 +8,7 @@ COVERAGE_FILE := coverage.out
 all: lint test build
 
 build:
+	$(GO) mod tidy
 	$(GO) build $(GOFLAGS) ./...
 
 test:
