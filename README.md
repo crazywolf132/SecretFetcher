@@ -40,7 +40,7 @@ SecretFetch gives you the best of all worlds:
 ## 🚀 Quick Start
 
 ```bash
-go get github.com/crazywolf132/SecretFetch
+go get github.com/crazywolf132/secretfetch
 ```
 
 ```go
