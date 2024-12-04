@@ -67,7 +67,7 @@ type SecretAccessMetric struct {
 	CacheHit bool
 }
 
-// secureValue represents a secret value with secure memory handling
+// secureValue represents a secret value with best-effort secure memory handling
 type secureValue struct {
 	value []byte
 	mu    sync.RWMutex
@@ -76,6 +76,15 @@ type secureValue struct {
 func (s *secureValue) Set(value string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// First zero any existing value
+	if s.value != nil {
+		for i := range s.value {
+			s.value[i] = 0
+		}
+	}
+
+	// Create new slice and copy value
 	s.value = make([]byte, len(value))
 	copy(s.value, value)
 }
@@ -83,16 +92,28 @@ func (s *secureValue) Set(value string) {
 func (s *secureValue) Get() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return string(s.value)
+
+	// Create a copy to return
+	// Note: This is necessary in Go as we can't prevent the returned
+	// string from being copied by the runtime
+	if s.value == nil {
+		return ""
+	}
+	result := make([]byte, len(s.value))
+	copy(result, s.value)
+	return string(result)
 }
 
 func (s *secureValue) Clear() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for i := range s.value {
-		s.value[i] = 0
+
+	if s.value != nil {
+		for i := range s.value {
+			s.value[i] = 0
+		}
+		s.value = nil
 	}
-	s.value = nil
 }
 
 // cachedValue represents a cached secret value

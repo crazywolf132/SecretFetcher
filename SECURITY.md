@@ -31,6 +31,20 @@ SecretFetch is designed with security as a top priority. This document outlines 
 - Supports audit logging
 - Zero persistent storage (stateless operation)
 
+### Memory Security Considerations
+
+SecretFetch implements best-effort secure memory handling within Go's constraints:
+
+1. **Garbage Collection**: Due to Go's garbage collection, we cannot guarantee when memory will be fully cleared from the system. The library implements explicit zeroing when values are cleared, but intermediate copies may exist in memory until garbage collected.
+
+2. **String Immutability**: Go strings are immutable and may be copied by the runtime. While we implement secure handling for our internal byte slices, we cannot prevent copies when returning string values.
+
+3. **Best Practices**:
+   - Use SecureCache option for sensitive values
+   - Call Clear() explicitly when done with secrets
+   - Be aware that perfect memory security is not possible in pure Go
+   - Consider using OS-level memory protection for highest security needs
+
 ## Best Practices
 
 ### AWS IAM Configuration
